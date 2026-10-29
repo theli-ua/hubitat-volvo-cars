@@ -4,10 +4,11 @@
  * Description: Manages connection and communication with Volvo Cars API.
  * Handles authentication, token management, and device creation.
  */
+import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 
 String appName() { return 'Volvo Cars' }
-String appVersion() { return '0.3.0' }
+String appVersion() { return '0.4.0' }
 String nameSpace() { return 'brianschmitt' }
 
 definition(
@@ -33,10 +34,54 @@ preferences {
     page(name: 'removeVehiclePage')
 }
 
+// Volvo disabled the public OAuth client `h4Yf0b` on 2026-10-26, which took down
+// every integration that signed in with it. The Volvo Cars app now uses
+// `mo2qy9h_10`: a public client (no secret) that requires Authorization Code +
+// PKCE and receives the code through the `vca://` app scheme. Volvo ID itself is
+// now Keycloak (realm `volvocars`), brokered by PingFederate on volvoid.
+String authClientId() { return 'mo2qy9h_10' }
+String authRedirectUri() { return 'vca://www.volvocars.com/l/vca/oauth/callback' }
 String authApiUrl() { return 'https://volvoid.eu.volvocars.com/as/authorization.oauth2' }
 String tokenUrl() { return 'https://volvoid.eu.volvocars.com/as/token.oauth2' }
 String revokeTokenUrl() { return 'https://volvoid.eu.volvocars.com/as/revoke_token.oauth2' }
 String apiBaseUrl() { return 'https://api.volvocars.com' }
+
+// Energy v2 needs energy:state:read and the location endpoint needs
+// location:read. Both were rejected by the retired h4Yf0b client; mo2qy9h_10
+// accepts them.
+List<String> authScopeList() {
+    return [
+        'openid',
+        'conve:brake_status',
+        'conve:climatization_start_stop',
+        'conve:command_accessibility',
+        'conve:commands',
+        'conve:diagnostics_engine_status',
+        'conve:diagnostics_workshop',
+        'conve:doors_status',
+        'conve:engine_status',
+        'conve:fuel_status',
+        'conve:honk_flash',
+        'conve:lock',
+        'conve:lock_status',
+        'conve:navigation',
+        'conve:odometer_status',
+        'conve:trip_statistics',
+        'conve:tyre_status',
+        'conve:unlock',
+        'conve:vehicle_relation',
+        'conve:warnings',
+        'conve:windows_status',
+        'energy:battery_charge_level',
+        'energy:charging_connection_status',
+        'energy:charging_system_status',
+        'energy:electric_range',
+        'energy:estimated_charging_time',
+        'energy:recharge_status',
+        'energy:state:read',
+        'location:read',
+    ]
+}
 
 void installed() {
     logInfo("Installing ${appName()} v${appVersion()}")
@@ -133,6 +178,16 @@ def authPage() {
             }
         }
 
+        section('Already Have A Token?') {
+            paragraph('Signing in above is the normal route. If Volvo changes their login again, a refresh '
+                + 'token obtained with tools/volvo_auth_probe.py can be pasted here as a stop-gap. It is '
+                + 'cleared from settings as soon as it is used.')
+            input 'manualRefreshToken', 'text', title: 'Refresh token', required: false, submitOnChange: true
+            if (settings.manualRefreshToken) {
+                input 'useManualToken', 'button', title: 'Use Pasted Refresh Token'
+            }
+        }
+
         if (atomicState.authError) {
             section('Authentication Error') {
                 paragraph "${atomicState.authError}"
@@ -150,7 +205,7 @@ def otpPage() {
         } else {
             section('OTP Authentication') {
                 paragraph(
-                    'After authenticating above, an OTP will be sent to your email address. Please enter it below.')
+                    'Volvo emails a 6-digit code once your password is accepted. Enter it below to finish signing in.')
                 input 'otpCode', 'text', title: 'OTP Code', required: true, submitOnChange: true
             }
 
@@ -159,7 +214,7 @@ def otpPage() {
             }
 
             if (atomicState.authError) {
-                if (!atomicState.otpUrl) {
+                if (!atomicState.otpAction) {
                     section('New OTP Required') {
                         input 'authenticate', 'button', title: 'Request New OTP'
                     }
@@ -260,9 +315,13 @@ void appButtonHandler(String btnName) {
         case 'confirmRemoveVehicle':
             removeVehicle()
             break
+        case 'useManualToken':
+            adoptManualRefreshToken()
+            break
         case 'clearAuthentication':
             atomicState.remove('username')
             atomicState.remove('vccApiKey')
+            clearAuthFlow()
             clearTokens()
             break
         default:
@@ -319,79 +378,48 @@ void addThisVehicle() {
 }
 
 void authenticate() {
-    logDebug 'Attempting authentication...'
+    logDebug 'Starting Volvo ID login (Keycloak + PKCE)...'
     atomicState.remove('authError')
-    atomicState.remove('otpUrl')
-    atomicState.remove('consecutiveOtpVerified')
+    clearAuthFlow()
 
-    Map payload = [
-        client_id: 'h4Yf0b',
+    String verifier = newPkceVerifier()
+    atomicState.pkceVerifier = verifier
+    Map jar = newCookieJar()
+
+    Map query = [
+        client_id: authClientId(),
+        redirect_uri: authRedirectUri(),
         response_type: 'code',
-        response_mode: 'pi.flow',
+        scope: authScopeList().join(' '),
+        code_challenge: pkceChallenge(verifier),
+        code_challenge_method: 'S256',
         acr_values: 'urn:volvoid:aal:bronze:2sv',
-
-        scope: 'openid ' +
-                'conve:brake_status ' +
-                'conve:climatization_start_stop ' +
-                'conve:command_accessibility ' +
-                'conve:commands ' +
-                'conve:diagnostics_engine_status ' +
-                'conve:diagnostics_workshop ' +
-                'conve:doors_status ' +
-                'conve:engine_status ' +
-                'conve:environment ' +
-                'conve:fuel_status ' +
-                'conve:honk_flash ' +
-                'conve:lock ' +
-                'conve:lock_status ' +
-                'conve:navigation ' +
-                'conve:odometer_status ' +
-                'conve:trip_statistics ' +
-                'conve:tyre_status ' +
-                'conve:unlock ' +
-                'conve:vehicle_relation ' +
-                'conve:warnings ' +
-                'conve:windows_status ' +
-                'energy:battery_charge_level ' +
-                'energy:charging_connection_status ' +
-                'energy:charging_system_status ' +
-                'energy:electric_range ' +
-                'energy:estimated_charging_time ' +
-                'energy:recharge_status '
-    // Note: Volvo will return a 400 error if you include the following scopes:
-    //   energy:charging_current_limit
-    //   energy:target_battery_level
-    //   location:read
-    //   conve:engine_start_stop
-    // Currently used but unknown why - API docs do not mention these:
-    //   conve:environment
-    //   conve:navigation
-    // Other scopes that may be available but not used:
-    //   email
-    //   profile
-    //   customer:attributes
-    //   vehicle:attributes
-    //   volvo_on_call:all
     ]
 
-    try {
-        httpPost([
-                    uri: authApiUrl(),
-                    body: payload,
-                    requestContentType: 'application/x-www-form-urlencoded',
-                    contentType: 'application/json'])
-        { resp ->
-            if (resp.status == 200 || resp.status == 400) {
-                def cookies = resp?.headers?.'Set-Cookie'
-                atomicState.authCookies = cookies
-                handleAuthResponse(resp.data)
-            } else {
-                handleAuthError("Initial authentication request failed. Status: ${resp.status}", resp.data)
-            }
-        }
-    } catch (e) {
-        handleAuthError("Exception during initial authentication: ${e.message}")
+    Map loginPage = authFollow('GET', authApiUrl() + '?' + formEncode(query), null, jar)
+    Map login = parseKcContext(loginPage.html)
+    if (login.pageId != 'login' || !login.loginAction) {
+        saveCookieJar(jar)
+        handleAuthError("Could not load the Volvo ID login page${login.message ? ": ${login.message}" : ''}",
+                        loginPage.error ?: snippet(loginPage.html))
+        return
     }
+
+    logDebug 'Volvo ID login page loaded, submitting credentials'
+    Map otpPage = authFollow('POST', login.loginAction,
+                             [username: settings.username, password: settings.password, credentialId: ''], jar)
+    Map otp = parseKcContext(otpPage.html)
+    if (otp.pageId != 'login-otp-email' || !otp.loginAction) {
+        saveCookieJar(jar)
+        handleAuthError("Volvo did not send an OTP code${otp.message ? ": ${otp.message}" : ''}",
+                        otpPage.error ?: "pageId=${otp.pageId ?: 'unknown'}")
+        logDebug "Login step response: ${snippet(otpPage.html, 300)}"
+        return
+    }
+
+    atomicState.otpAction = otp.loginAction
+    saveCookieJar(jar)
+    logInfo 'Volvo has emailed a one-time code to this Volvo ID. Enter it to finish signing in.'
 }
 
 def fixHttpUrl(String url) {
@@ -404,47 +432,57 @@ def fixHttpUrl(String url) {
 void submitOtp() {
     logDebug 'Submitting OTP...'
     atomicState.remove('authError')
-    String otpUrl = atomicState.otpUrl
-    if (!otpUrl) {
-        handleAuthError('OTP submission URL not found. Please restart authentication.')
+
+    String otpAction = atomicState.otpAction
+    if (!otpAction) {
+        handleAuthError('That login session has ended. Save your credentials, or press "Request New OTP".')
         return
     }
 
-    otpUrl = fixHttpUrl(otpUrl)
+    Map jar = loadCookieJar()
+    Map result = authFollow('POST', fixHttpUrl(otpAction), [otp: settings.otpCode.trim()], jar)
 
-    Map payload = [otp: settings.otpCode]
-    Map headers = apiHeaders(true, false) + ['x-xsrf-header': 'PingFederate', 'Cookie': atomicState.authCookies]
-
-    atomicState.remove('otpUrl') // use only once
-
-    logDebug "OTP URL: ${otpUrl}, Payload: ${payload}, Headers: ${headers}"
-    try {
-        httpPostJson([
-                uri: otpUrl,
-                body: payload,
-                headers: headers,
-                contentType: 'application/json'])
-        { resp ->
-            logDebug "OTP submission response status: ${resp.status}"
-            logDebug "OTP submission response body: ${resp.data}"
-            logDebug "OTP submission response headers: ${resp.headers}"
-            if (resp.status == 200) {
-                app.removeSetting('password')
-                def cookies = resp?.headers?.'Set-Cookie'
-                atomicState.authCookies = cookies
-                handleAuthResponse(resp.data)
-             } else {
-                handleAuthError("OTP submission failed. Status: ${resp.status}", resp.data)
-            }
-        }
-    } catch (e) {
+    if (result.code) {
+        logDebug "Authorization code received (length ${result.code.length()})"
         app.removeSetting('otpCode')
-        handleAuthError("Exception during OTP submission: ${e.message}")
+        saveCookieJar(jar)
+        requestToken(result.code)
+        return
     }
+
+    Map otp = parseKcContext(result.html)
+    if (otp.pageId == 'login-otp-email' && otp.loginAction) {
+        // Volvo re-serves the OTP form with a fresh action for each attempt.
+        atomicState.otpAction = otp.loginAction
+        saveCookieJar(jar)
+        handleAuthError("Volvo rejected the OTP code${otp.message ? ": ${otp.message}" : ''}")
+        return
+    }
+
+    app.removeSetting('otpCode')
+    clearAuthFlow()
+    handleAuthError("Sign-in failed${otp.message ? ": ${otp.message}" : (result.error ? ": ${result.error}" : '')}"
+                    + '. Enter your credentials again to restart it.')
 }
 
 void refreshTokenNow() {
     logDebug 'Manual token refresh requested.'
+    refreshToken()
+}
+
+// Recovery path if Volvo breaks this login the way they broke the previous one:
+// a refresh token obtained out of band is adopted and the app continues normally.
+void adoptManualRefreshToken() {
+    String token = settings.manualRefreshToken?.trim()
+    app.removeSetting('manualRefreshToken')
+    if (!token) {
+        handleAuthError('No refresh token was pasted.')
+        return
+    }
+    logInfo 'Adopting a manually supplied refresh token.'
+    clearAuthFlow()
+    atomicState.refreshToken = token
+    atomicState.remove('authError')
     refreshToken()
 }
 
@@ -532,9 +570,10 @@ void refreshToken() {
 
     Map payload = [
         refresh_token: atomicState.refreshToken,
-        grant_type: 'refresh_token'
+        grant_type: 'refresh_token',
+        client_id: authClientId(),
     ]
-    Map headers = apiHeaders(false, true)
+    Map headers = tokenHeaders()
 
     try {
         httpPost([
@@ -549,7 +588,7 @@ void refreshToken() {
                 atomicState.remove('authError')
                 logDebug 'Successfully refreshed tokens.'
              } else {
-                handleAuthError("Token refresh failed. Status: ${resp.status}", resp.data)
+                handleAuthError("Token refresh failed. Status: ${resp.status}", snippet(resp.data))
                 clearTokens()
             }
         }
@@ -578,140 +617,351 @@ private void storeTokens(Map tokenData) {
     }
 }
 
-private void handleAuthResponse(Map json) {
-    logDebug "Handling auth response: ${json}"
-    String status = json.status
-    logDebug "Authentication status: ${status}"
-    // Loop protection: detect repeated OTP_VERIFIED to prevent infinite recursion
-    int consecutiveOtpVerified = atomicState.consecutiveOtpVerified ?: 0
-    if (status == 'OTP_VERIFIED') {
-        consecutiveOtpVerified++
-        atomicState.consecutiveOtpVerified = consecutiveOtpVerified
-        logWarn "OTP_VERIFIED received ${consecutiveOtpVerified} time(s) in a row — possible loop"
-        if (consecutiveOtpVerified > 3) {
-            handleAuthError("Authentication loop detected: OTP_VERIFIED repeated ${consecutiveOtpVerified} times. The continueAuthentication endpoint may require a different method or step. Check debug logs for details.")
-            atomicState.remove('consecutiveOtpVerified')
+// ---------------------------------------------------------------------------
+// Login transport.
+//
+// Sign-in crosses two hosts (volvoid.eu.volvocars.com, then auth.volvocars.com)
+// with redirects between them, and every hop sets cookies the next hop needs.
+// Hops are followed by hand so the jar stays visible. If Hubitat's own HTTP
+// client follows a hop instead, that is tolerated: the only hop it cannot
+// follow is the `vca://` app callback, and when that surfaces as an exception
+// the authorization code is recovered from the exception text.
+// ---------------------------------------------------------------------------
+
+private Map authFollow(String method, String startUrl, Map form, Map jar) {
+    String url = startUrl
+    for (int hop = 0; hop < 8; hop++) {
+        url = fixHttpUrl(url)
+        Map resp = authRequest(method, url, form, jar)
+        logDebug "auth hop ${hop + 1}: ${method} ${scrubUrl(url)} -> status ${resp.status}"
+
+        if (resp.code) {
+            return resp
+        }
+        if (resp.error && !resp.html) {
+            return resp
+        }
+        if (resp.status >= 300 && resp.status < 400 && resp.location) {
+            if (resp.location.startsWith('vca://')) {
+                Map callback = parseCallbackUrl(resp.location)
+                if (!callback.code) {
+                    logError "Volvo callback carried no authorization code: ${scrubUrl(resp.location)}"
+                }
+                return callback
+            }
+            url = absoluteUrl(resp.location, url)
+            method = 'GET'
+            form = null
+            continue
+        }
+        if (resp.status >= 400) {
+            resp.error = "HTTP ${resp.status} from ${urlHost(url)}"
+            return resp
+        }
+        return resp
+    }
+    return [error: 'Too many redirects while signing in to Volvo ID']
+}
+
+private Map authRequest(String method, String url, Map form, Map jar) {
+    Map result = [status: 0, location: null, html: null, error: null, code: null]
+
+    Map headers = [
+        'User-Agent': 'vca-android/123',
+        'Accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    ]
+    String cookies = cookieHeader(url, jar)
+    if (cookies) {
+        headers['Cookie'] = cookies
+    }
+
+    Map params = [uri: url, headers: headers, contentType: 'text/html', timeout: 30]
+    if (form != null) {
+        params.body = form
+        params.requestContentType = 'application/x-www-form-urlencoded'
+    }
+
+    try {
+        if (form == null) {
+            httpGet(params) { resp -> captureAuthResponse(resp, url, result, jar) }
+        } else {
+            httpPost(params) { resp -> captureAuthResponse(resp, url, result, jar) }
+        }
+    } catch (e) {
+        // Non-2xx responses and unfollowable `vca://` redirects both land here.
+        // Volvo's response body is not exposed on either, but the exception text
+        // often contains the callback URL the client failed to follow.
+        String message = e.message ?: e.toString()
+        logDebug "auth request exception: ${message}"
+        Map callback = parseCallbackUrl(message)
+        if (callback.code) {
+            logDebug 'Recovered the authorization code from the exception text'
+            result.code = callback.code
+        } else {
+            result.error = message
+        }
+    }
+    return result
+}
+
+private void captureAuthResponse(resp, String url, Map result, Map jar) {
+    result.status = resp.status
+    storeCookies(url, resp.headers, jar)
+    def location = resp.headers?.location ?: resp.headers?.Location
+    if (location) {
+        result.location = location.toString()
+    }
+    result.html = bodyText(resp.data)
+}
+
+// ---------------------------------------------------------------------------
+// Keycloak page reading.
+//
+// Volvo ID is Keycloak (realm `volvocars`). The login page is a themed template
+// that carries its state in a `kcContext` object rather than plain form fields;
+// it also embeds JavaScript, so it is not parseable as JSON - the three values
+// this flow needs are pulled out individually.
+// ---------------------------------------------------------------------------
+
+private Map parseKcContext(String html) {
+    if (!html) {
+        return [pageId: null, loginAction: null, message: null]
+    }
+    return [
+        pageId: kcValue(html, 'pageId'),
+        loginAction: kcValue(html, 'loginAction'),
+        message: kcValue(html, 'summary'),
+    ]
+}
+
+private String kcValue(String html, String key) {
+    def matcher = (html =~ /"(${key})"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+    if (!matcher.find()) {
+        return null
+    }
+    String value = matcher.group(2)
+    value = value.replace('\\/', '/').replace('\\u002F', '/')
+    value = value.replace('\\u0026', '&').replace('\\u003d', '=')
+    return value.replace('&amp;', '&')
+}
+
+// ---------------------------------------------------------------------------
+// Cookie jar.
+//
+// Set-Cookie Path/Domain attributes are deliberately ignored: the Keycloak
+// cookies are host-only on auth.volvocars.com under /realms/volvocars/, and
+// every request this flow makes to that host is under that path.
+// ---------------------------------------------------------------------------
+
+private Map newCookieJar() {
+    return [:]
+}
+
+private Map loadCookieJar() {
+    def jar = atomicState.authCookieJar
+    return (jar instanceof Map) ? new LinkedHashMap(jar) : newCookieJar()
+}
+
+private void saveCookieJar(Map jar) {
+    atomicState.authCookieJar = jar
+    logDebug "Cookie jar: ${jar.collect { host, cookies -> "${host}=[${cookies.keySet().join(', ')}]" }.join(' ')}"
+}
+
+private void storeCookies(String url, def headers, Map jar) {
+    def raw = headers?.'Set-Cookie' ?: headers?.'set-cookie'
+    if (!raw) {
+        return
+    }
+    List<String> items = (raw instanceof List) ? raw.collect { it.toString() } : [raw.toString()]
+    String host = urlHost(url)
+    Map hostJar = (jar[host] instanceof Map) ? jar[host] : [:]
+    items.each { String item ->
+        String pair = item.split(';')[0]
+        int eq = pair.indexOf('=')
+        if (eq <= 0) {
             return
         }
-    } else {
-        atomicState.remove('consecutiveOtpVerified')
-    }
-
-    if (status == 'COMPLETED') {
-        def code = json?.authorizeResponse?.code
-        if (code) {
-            requestToken(code)
+        String name = pair.substring(0, eq).trim()
+        String value = pair.substring(eq + 1)
+        if (value.length() == 0) {
+            hostJar.remove(name)
         } else {
-            handleAuthError('Authentication completed, but no authorization code received.')
-        }
-    } else if (status == 'OTP_REQUIRED') {
-        atomicState.otpUrl = json?._links?.checkOtp?.href + '?action=checkOtp'
-        if (atomicState.otpUrl) {
-            logDebug "OTP Required. Stored OTP URL: ${atomicState.otpUrl}"
-        } else {
-            handleAuthError('OTP required, but OTP submission URL not found in response.')
-        }
-    } else if (status == 'OTP_VERIFIED') {
-        String rawHref = json?._links?.continueAuthentication?.href
-        logDebug "OTP_VERIFIED: raw continueAuthentication href: ${rawHref}"
-        String continueUrl = rawHref ? rawHref + '?action=continueAuthentication' : null
-        logDebug "OTP_VERIFIED: final continueUrl: ${continueUrl}"
-        if (continueUrl) {
-            continueAuthentication(continueUrl)
-        } else {
-            handleAuthError('OTP verified, but continuation URL not found.')
-        }
-    } else if (status == 'USERNAME_PASSWORD_REQUIRED') {
-        String checkUserPassUrl = json?._links?.checkUsernamePassword?.href + '?action=checkUsernamePassword'
-        if (checkUserPassUrl) {
-            submitUsernamePassword(checkUserPassUrl)
-         } else {
-            handleAuthError('Username/Password required, but submission URL not found.')
+            hostJar[name] = value
         }
     }
-    else {
-        handleAuthError("Unhandled authentication status: ${status}", json.toString())
-    }
+    jar[host] = hostJar
 }
 
-private void submitUsernamePassword(String url) {
-    logDebug 'Submitting username/password...'
-    Map payload = [
-        username: settings.username,
-        password: settings.password
-    ]
-    Map headers = apiHeaders(false, true) + ['x-xsrf-header': 'PingFederate', 'Cookie': atomicState.authCookies]
-
-    url = fixHttpUrl(url)
-
-    try {
-        httpPostJson([uri: url, body: payload, headers: headers, contentType: 'application/json']) { resp ->
-            if (resp.status == 200 || resp.status == 400) {
-                def cookies = resp?.headers?.'Set-Cookie'
-                atomicState.authCookies = cookies
-                handleAuthResponse(resp.data)
-             } else {
-                handleAuthError("Username/Password submission failed. Status: ${resp.status}", resp.data)
-            }
-        }
-    } catch (e) {
-        handleAuthError("Exception during Username/Password submission: ${e.message}")
+private String cookieHeader(String url, Map jar) {
+    Map hostJar = jar[urlHost(url)]
+    if (!hostJar) {
+        return null
     }
+    return hostJar.collect { name, value -> "${name}=${value}" }.join('; ')
 }
 
-private void continueAuthentication(String url) {
-    url = fixHttpUrl(url)
-    logDebug "Continuing authentication flow... URL: ${url}"
-    logDebug "Cookies being sent: ${atomicState.authCookies}"
-    try {
-        Map headers = apiHeaders(false, true) + ['x-xsrf-header': 'PingFederate', 'Cookie': atomicState.authCookies]
-        logDebug "Continue auth headers: ${headers}"
-        // Use POST (not GET) to advance the flow — GET only reads current state
-        httpPostJson([uri: url, body: [:], headers: headers, contentType: 'application/json']) { resp ->
-            logDebug "Continue auth response status: ${resp.status}"
-            logDebug "Continue auth response body: ${resp.data}"
-            logDebug "Continue auth response headers: ${resp.headers}"
-            if (resp.status == 200 || resp.status == 400) {
-                def cookies = resp?.headers?.'Set-Cookie'
-                logDebug "New cookies from continue auth: ${cookies}"
-                atomicState.authCookies = cookies
-                handleAuthResponse(resp.data)
-             } else {
-                handleAuthError("Continue authentication step failed. Status: ${resp.status}", resp.data)
-            }
-        }
-    } catch (e) {
-        handleAuthError("Exception during continue authentication: ${e.message}")
+// ---------------------------------------------------------------------------
+// URL and PKCE helpers. java.net.URLEncoder is avoided to keep this inside the
+// Hubitat sandbox; PKCE needs SHA-256 and base64url only.
+// ---------------------------------------------------------------------------
+
+private String urlHost(String url) {
+    String host = url.replaceFirst('^https?://', '')
+    int cut = host.indexOf('/')
+    if (cut < 0) {
+        cut = host.indexOf('?')
     }
+    if (cut >= 0) {
+        host = host.substring(0, cut)
+    }
+    return host.toLowerCase()
+}
+
+private String absoluteUrl(String location, String base) {
+    String target = location.trim()
+    if (target.startsWith('http://') || target.startsWith('https://') || target.startsWith('vca://')) {
+        return target
+    }
+    int schemeAt = base.indexOf('://')
+    if (target.startsWith('//') && schemeAt > 0) {
+        return base.substring(0, schemeAt + 1) + target
+    }
+    if (target.startsWith('/') && schemeAt > 0) {
+        int pathAt = base.indexOf('/', schemeAt + 3)
+        String schemeHost = pathAt > 0 ? base.substring(0, pathAt) : base
+        return schemeHost + target
+    }
+    int queryAt = base.indexOf('?')
+    String pathPart = queryAt > 0 ? base.substring(0, queryAt) : base
+    return pathPart.substring(0, pathPart.lastIndexOf('/') + 1) + target
+}
+
+private Map parseCallbackUrl(String text) {
+    Map out = [code: null, error: null]
+    if (!text) {
+        return out
+    }
+    def matcher = (text =~ /[?&](code|error|error_description)=([^&"'\\\s<>]+)/)
+    while (matcher.find()) {
+        String key = matcher.group(1)
+        String value = matcher.group(2)
+        if (key == 'code') {
+            out.code = value
+        } else if (!out.error) {
+            out.error = value
+        }
+    }
+    return out
+}
+
+private String formEncode(Map params) {
+    return params.collect { key, value -> "${pctEncode(key.toString())}=${pctEncode(value.toString())}" }.join('&')
+}
+
+private String pctEncode(String value) {
+    StringBuilder out = new StringBuilder()
+    value.getBytes('UTF-8').each { byte b ->
+        int c = b & 0xFF
+        boolean safe = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
+                       || c == 0x2D || c == 0x2E || c == 0x5F || c == 0x7E
+        if (safe) {
+            out.append((char) c)
+        } else {
+            out.append('%').append(String.format('%02X', c))
+        }
+    }
+    return out.toString()
+}
+
+private String newPkceVerifier() {
+    byte[] random = new byte[48]
+    new java.security.SecureRandom().nextBytes(random)
+    return base64Url(random)
+}
+
+private String pkceChallenge(String verifier) {
+    byte[] digest = java.security.MessageDigest.getInstance('SHA-256').digest(verifier.getBytes('UTF-8'))
+    return base64Url(digest)
+}
+
+private String base64Url(byte[] data) {
+    String encoded = data.encodeBase64().toString().replaceAll('\\s', '')
+    return encoded.replace('+', '-').replace('/', '_').replaceAll('=+$', '')
+}
+
+private String scrubUrl(String url) {
+    if (!url) {
+        return null
+    }
+    return url.replaceAll('(code|state)=[^&]*', '$1=<hidden>')
+}
+
+private void clearAuthFlow() {
+    atomicState.remove('otpAction')
+    atomicState.remove('pkceVerifier')
+    atomicState.remove('authCookieJar')
+    atomicState.remove('otpUrl')
+    atomicState.remove('authCookies')
+    atomicState.remove('consecutiveOtpVerified')
+}
+
+private String bodyText(def data) {
+    if (data == null) {
+        return null
+    }
+    if (data instanceof CharSequence) {
+        return data.toString()
+    }
+    return JsonOutput.toJson(data)
+}
+
+// Volvo returns whole HTML pages where an error body is expected; keep the log
+// readable and never write a session code into it.
+private String snippet(def text, int maxChars = 600) {
+    String value = bodyText(text)
+    if (!value) {
+        return null
+    }
+    value = value.replaceAll('(?s)\\s+', ' ').replaceAll('(code|session_code|state)=[^&"\\s]*', '$1=<hidden>')
+    return value.length() > maxChars ? value.substring(0, maxChars) + '...' : value
 }
 
 private void requestToken(String authCode) {
-    logDebug 'Requesting token with authorization code...'
+    logDebug 'Exchanging the authorization code for tokens...'
+
+    String verifier = atomicState.pkceVerifier
+    if (!verifier) {
+        handleAuthError('The PKCE verifier for this login is missing. Enter your credentials again to restart it.')
+        return
+    }
 
     Map payload = [
+        grant_type: 'authorization_code',
         code: authCode,
-        grant_type: 'authorization_code'
+        redirect_uri: authRedirectUri(),
+        client_id: authClientId(),
+        code_verifier: verifier,
     ]
-    Map headers = apiHeaders(false, true) + ['Cookie': atomicState.authCookies]
 
     try {
         httpPost([
                 uri: tokenUrl(),
                 body: payload,
-                headers: headers,
+                headers: tokenHeaders(),
                 requestContentType: 'application/x-www-form-urlencoded',
                 contentType: 'application/json'])
         { resp ->
             if (resp.status == 200) {
                 storeTokens(resp.data)
                 atomicState.remove('authError')
-                atomicState.remove('authCookies')
+                clearAuthFlow()
              } else {
-                handleAuthError("Token request failed. Status: ${resp.status}", resp.data)
+                handleAuthError("Token request failed. Status: ${resp.status}", snippet(resp.data))
             }
         }
     } catch (e) {
-        handleAuthError("Exception during token request: ${e}")
+        handleAuthError("Exception during token request: ${e.message}")
     }
 }
 
@@ -875,19 +1125,21 @@ void refreshAllVehicleData() {
     }
 }
 
-private Map apiHeaders(boolean includeAuth = true, boolean includeStandardAuth = false) {
+private Map apiHeaders(boolean includeAuth = true) {
     def headers = [
         'User-Agent': 'vca-android/123',
         'vcc-api-key': settings.vccApiKey
     ]
     if (includeAuth && atomicState.accessToken) {
         headers['Authorization'] = "Bearer ${atomicState.accessToken}"
-    } else if (includeStandardAuth) {
-        headers['Authorization'] = ('Basic '
-         + 'aDRZZjBiOlU4WWtTYlZsNnh3c2c1WVFxWmZyZ1ZtSWFEcGhP'
-         + 'c3kxUENhVXNpY1F0bzNUUjVrd2FKc2U0QVpkZ2ZJZmNMeXc=')
     }
     return headers
+}
+
+// Token endpoint calls carry no secret: mo2qy9h_10 proves possession with the
+// PKCE verifier on code exchange, and with the refresh token afterwards.
+private Map tokenHeaders() {
+    return ['User-Agent': 'vca-android/123', 'Accept': 'application/json']
 }
 
 private String formatExpiry(Long expiryTimestamp) {

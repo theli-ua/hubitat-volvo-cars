@@ -713,6 +713,15 @@ private void captureAuthResponse(resp, String url, Map result, Map jar) {
     }
     result.html = bodyText(resp.data)
     result.bytes = result.html ? result.html.length() : 0
+    result.type = dataClassName(resp.data)
+}
+
+private String dataClassName(def data) {
+    try {
+        return data == null ? 'null' : data.getClass().getName()
+    } catch (ignored) {
+        return 'unknown'
+    }
 }
 
 // One-line description of a failed step. Hubitat's debug logging auto-disables
@@ -727,6 +736,7 @@ private String describeHttp(Map resp, int maxChars = 400) {
     sb.append(' bytes=').append(resp.bytes ?: 0)
     sb.append(' location=').append(scrubUrl(resp.location) ?: '-')
     sb.append(' error=').append(resp.error ?: '-')
+    sb.append(' type=').append(resp.type ?: '-')
     sb.append(' body=').append(snippet(resp.html, maxChars) ?: '-')
     return sb.toString()
 }
@@ -928,10 +938,21 @@ private String bodyText(def data) {
     if (data instanceof CharSequence) {
         return data.toString()
     }
-    // Hubitat returns a text body as [length: n, text: '...']; re-serialising that
-    // map would escape every quote in the HTML and break the kcContext regex.
+    // A text body comes back as a [length, text] wrapper - as a map in some calls
+    // and as a wrapper object in others, so unwrap it by property rather than by
+    // type. Re-serialising the wrapper escapes every quote in the page and breaks
+    // the kcContext regex.
     if (data instanceof Map && data.containsKey('text')) {
         return data['text']?.toString()
+    }
+    try {
+        def wrapperText = data.text
+        def wrapperLength = data.length
+        if (wrapperText != null && wrapperLength instanceof Number) {
+            return wrapperText.toString()
+        }
+    } catch (ignored) {
+        // not a text wrapper
     }
     return JsonOutput.toJson(data)
 }

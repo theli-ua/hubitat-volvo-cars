@@ -699,7 +699,7 @@ private Map authRequest(String method, String url, Map form, Map jar) {
     }
     result.sentCookies = cookies ? cookies.split(';').collect { it.trim().split('=')[0] }.join(',') : 'none'
 
-    Map params = [uri: url, headers: headers, textParser: true, timeout: 30]
+    Map params = [uri: url, headers: headers, textParser: true, timeout: 30, followRedirects: false]
     if (form != null) {
         params.body = form
         params.requestContentType = 'application/x-www-form-urlencoded'
@@ -732,6 +732,11 @@ private void captureAuthResponse(resp, String url, Map result, Map jar) {
     result.status = resp.status
     storeCookies(url, resp.headers, jar)
     result.receivedCookies = cookieNames(resp.headers)
+    try {
+        result.headersDump = resp.headers?.toString()
+    } catch (ignored) {
+        result.headersDump = null
+    }
     def location = resp.headers?.location ?: resp.headers?.Location
     if (location) {
         result.location = location.toString()
@@ -835,11 +840,10 @@ private void saveCookieJar(Map jar) {
 }
 
 private void storeCookies(String url, def headers, Map jar) {
-    def raw = headers?.'Set-Cookie' ?: headers?.'set-cookie'
-    if (!raw) {
+    List<String> items = setCookieList(headers)
+    if (!items) {
         return
     }
-    List<String> items = (raw instanceof List) ? raw.collect { it.toString() } : [raw.toString()]
     String host = urlHost(url)
     Map hostJar = (jar[host] instanceof Map) ? jar[host] : [:]
     items.each { String item ->
@@ -859,19 +863,32 @@ private void storeCookies(String url, def headers, Map jar) {
     jar[host] = hostJar
 }
 
+// Hubitat may return repeated Set-Cookie headers as a list or as one joined
+// string. Splitting on ', ' followed by `name=` is safe: an Expires attribute's
+// comma is followed by a date, never by `name=`.
+private List<String> setCookieList(def headers) {
+    def raw = headers?.'Set-Cookie' ?: headers?.'set-cookie'
+    if (raw == null) {
+        return []
+    }
+    if (raw instanceof List) {
+        return raw.collect { it.toString() }
+    }
+    return raw.toString().split(/,\s*(?=[A-Za-z0-9_.\-]+=)/).findAll { it?.trim() }
+}
+
 // Names Volvo set on a response, so a swallowed redirect hop is visible.
 private String cookieNames(def headers) {
-    def raw = headers?.'Set-Cookie' ?: headers?.'set-cookie'
-    if (!raw) {
+    List<String> items = setCookieList(headers)
+    if (!items) {
         return 'none'
     }
-    List<String> items = (raw instanceof List) ? raw.collect { it.toString() } : [raw.toString()]
     return items.collect { it.split(';')[0].split('=')[0] }.join(',')
 }
 
-// Temporary diagnostic: can Hubitat be told not to follow redirects? That is the
-// only thing blocking in-app sign-in, because Keycloak mints AUTH_SESSION_ID on
-// the hop Hubitat follows by itself.
+// Chain probe: follow the authorize redirect by hand and check that the cookies
+// Keycloak mints on the next hop reach us. Without AUTH_SESSION_ID the
+// credentials POST can never carry a session.
 void redirectProbe() {
     Map query = [
         client_id: authClientId(),
@@ -882,31 +899,25 @@ void redirectProbe() {
         code_challenge_method: 'S256',
         acr_values: 'urn:volvoid:aal:bronze:2sv',
     ]
-    String url = authApiUrl() + '?' + formEncode(query)
+    Map jar = newCookieJar()
 
-    List probes = [['baseline', [:]], ['followRedirects-false', [followRedirects: false]],
-                   ['maxRedirects-0', [maxRedirects: 0]], ['allowRedirects-false', [allowRedirects: false]]]
-    probes.each { List probe ->
-        String label = probe[0]
-        Map extra = probe[1]
-        Map jar = newCookieJar()
-        Map res = authRequestProbed(url, jar, extra)
-        logWarn "redirect probe [${label}]: status=${res.status ?: 'n/a'} location=${scrubUrl(res.location) ?: '-'} setCookies=${res.receivedCookies ?: '-'} error=${res.error ?: '-'}"
+    Map hop1 = authRequest('GET', authApiUrl() + '?' + formEncode(query), null, jar)
+    logWarn "probe hop1: status=${hop1.status ?: 'n/a'} setCookies=${hop1.receivedCookies ?: '-'} location=${scrubUrl(hop1.location) ?: '-'} error=${hop1.error ?: '-'}"
+    if (!hop1.location) {
+        logWarn 'probe verdict: no 302 to follow - hand-following is not possible'
+        return
     }
-}
 
-// httpGet with extra request parameters, for the probe only.
-private Map authRequestProbed(String url, Map jar, Map extraParams) {
-    Map result = [status: 0, location: null, html: null, error: null]
-    Map headers = ['User-Agent': 'vca-android/123', 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8']
-    Map params = [uri: url, headers: headers, textParser: true, timeout: 30]
-    extraParams.each { k, v -> params[k] = v }
-    try {
-        httpGet(params) { resp -> captureAuthResponse(resp, url, result, jar) }
-    } catch (e) {
-        result.error = e.message ?: e.toString()
+    String hop2Url = absoluteUrl(hop1.location, authApiUrl())
+    Map hop2 = authRequest('GET', hop2Url, null, jar)
+    Map kc = parseKcContext(hop2.html)
+    logWarn "probe hop2: status=${hop2.status ?: 'n/a'} bytes=${hop2.bytes ?: 0} pageId=${kc.pageId ?: '-'} setCookies=${hop2.receivedCookies ?: '-'} error=${hop2.error ?: '-'}"
+    logWarn "probe jar would send to ${urlHost(hop2Url)}: ${cookieHeader(hop2Url, jar) ?: 'nothing'}"
+    boolean sessionVisible = (hop2.receivedCookies ?: '').contains('AUTH_SESSION_ID')
+    logWarn "probe verdict: AUTH_SESSION_ID ${sessionVisible ? 'is visible - in-app sign-in is possible' : 'is NOT visible - header dump follows'}"
+    if (!sessionVisible) {
+        logWarn "probe header dump: ${snippet(hop2.headersDump, 600) ?: '-'}"
     }
-    return result
 }
 
 private String cookieHeader(String url, Map jar) {

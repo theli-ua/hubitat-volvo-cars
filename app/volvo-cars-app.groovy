@@ -383,6 +383,13 @@ void authenticate() {
     clearAuthFlow()
 
     String verifier = newPkceVerifier()
+    String challenge
+    try {
+        challenge = pkceChallenge(verifier)
+    } catch (e) {
+        handleAuthError("Could not build the PKCE challenge - the sandbox may be blocking SHA-256: ${e.message}")
+        return
+    }
     atomicState.pkceVerifier = verifier
     Map jar = newCookieJar()
 
@@ -391,7 +398,7 @@ void authenticate() {
         redirect_uri: authRedirectUri(),
         response_type: 'code',
         scope: authScopeList().join(' '),
-        code_challenge: pkceChallenge(verifier),
+        code_challenge: challenge,
         code_challenge_method: 'S256',
         acr_values: 'urn:volvoid:aal:bronze:2sv',
     ]
@@ -713,15 +720,29 @@ private void captureAuthResponse(resp, String url, Map result, Map jar) {
     }
     result.html = bodyText(resp.data)
     result.bytes = result.html ? result.html.length() : 0
-    result.type = dataClassName(resp.data)
+    result.type = dataKind(resp.data)
 }
 
-private String dataClassName(def data) {
-    try {
-        return data == null ? 'null' : data.getClass().getName()
-    } catch (ignored) {
-        return 'unknown'
+// Describe the body shape without reflection: Hubitat's sandbox rejects
+// getClass(), which aborts the whole script.
+private String dataKind(def data) {
+    if (data == null) {
+        return 'null'
     }
+    if (data instanceof CharSequence) {
+        return 'text'
+    }
+    if (data instanceof Map) {
+        return "map[${((Map) data).keySet().take(4).join(', ')}]"
+    }
+    try {
+        if (data.text != null && data.length instanceof Number) {
+            return 'text-wrapper'
+        }
+    } catch (ignored) {
+        // not a text wrapper
+    }
+    return 'object'
 }
 
 // One-line description of a failed step. Hubitat's debug logging auto-disables
@@ -900,9 +921,12 @@ private String pctEncode(String value) {
 }
 
 private String newPkceVerifier() {
-    byte[] random = new byte[48]
-    new java.security.SecureRandom().nextBytes(random)
-    return base64Url(random)
+    // 64 hex chars is a valid code_verifier (43-128 unreserved). UUID is backed by
+    // a secure random source and, unlike java.security.SecureRandom, is known to
+    // be reachable from the Hubitat sandbox.
+    String verifier = java.util.UUID.randomUUID().toString().replace('-', '')
+    verifier = verifier + java.util.UUID.randomUUID().toString().replace('-', '')
+    return verifier
 }
 
 private String pkceChallenge(String verifier) {

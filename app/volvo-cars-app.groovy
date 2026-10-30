@@ -178,12 +178,6 @@ def authPage() {
             }
         }
 
-        section('Login Diagnostics') {
-            paragraph('Sign-in trouble usually means Volvo moved the login again. This fetches the authorize '
-                + 'redirect and the page behind it without credentials, and reports which cookies came back.')
-            input 'runRedirectProbe', 'button', title: 'Run redirect probe'
-        }
-
         section('Already Have A Token?') {
             paragraph('Signing in above is the normal route. It is only worth reaching for this if Volvo breaks '
                 + 'the login page again: tools/volvo_auth_probe.py can mint a refresh token from a browser '
@@ -320,9 +314,6 @@ void appButtonHandler(String btnName) {
             break
         case 'confirmRemoveVehicle':
             removeVehicle()
-            break
-        case 'runRedirectProbe':
-            redirectProbe()
             break
         case 'useManualToken':
             adoptManualRefreshToken()
@@ -743,12 +734,6 @@ private void captureAuthResponse(resp, String url, Map result, Map jar) {
     List<String> setCookies = rawSetCookies(resp)
     storeCookies(url, setCookies, jar)
     result.receivedCookies = cookieNames(setCookies)
-    result.cookieCount = setCookies.size()
-    try {
-        result.headersDump = resp.headers?.toString()
-    } catch (ignored) {
-        result.headersDump = null
-    }
     def location = resp.headers?.location ?: resp.headers?.Location
     if (location) {
         result.location = location.toString()
@@ -794,6 +779,7 @@ private String describeHttp(Map resp, int maxChars = 400) {
     sb.append(' error=').append(resp.error ?: '-')
     sb.append(' type=').append(resp.type ?: '-')
     sb.append(' sentCookies=').append(resp.sentCookies ?: '-')
+    sb.append(' setCookies=').append(resp.receivedCookies ?: '-')
     sb.append(' body=').append(snippet(resp.html, maxChars) ?: '-')
     return sb.toString()
 }
@@ -935,41 +921,6 @@ private String cookieNames(List<String> setCookies) {
     }
     return setCookies.collect { it.split(';')[0].split('=')[0] }.join(',')
 }
-
-// Chain probe: follow the authorize redirect by hand and check that the cookies
-// Keycloak mints on the next hop reach us. Without AUTH_SESSION_ID the
-// credentials POST can never carry a session.
-void redirectProbe() {
-    Map query = [
-        client_id: authClientId(),
-        redirect_uri: authRedirectUri(),
-        response_type: 'code',
-        scope: 'openid conve:vehicle_relation',
-        code_challenge: pkceChallenge(newPkceVerifier()),
-        code_challenge_method: 'S256',
-        acr_values: 'urn:volvoid:aal:bronze:2sv',
-    ]
-    Map jar = newCookieJar()
-
-    Map hop1 = authRequest('GET', authApiUrl() + '?' + formEncode(query), null, jar)
-    logWarn "probe hop1: status=${hop1.status ?: 'n/a'} setCookies=${hop1.receivedCookies ?: '-'} location=${scrubUrl(hop1.location) ?: '-'} error=${hop1.error ?: '-'}"
-    if (!hop1.location) {
-        logWarn 'probe verdict: no 302 to follow - hand-following is not possible'
-        return
-    }
-
-    String hop2Url = absoluteUrl(hop1.location, authApiUrl())
-    Map hop2 = authRequest('GET', hop2Url, null, jar)
-    Map kc = parseKcContext(hop2.html)
-    logWarn "probe hop2: status=${hop2.status ?: 'n/a'} bytes=${hop2.bytes ?: 0} pageId=${kc.pageId ?: '-'} setCookies=${hop2.receivedCookies ?: '-'} (${hop2.cookieCount ?: 0} headers) error=${hop2.error ?: '-'}"
-    logWarn "probe jar would send to ${urlHost(hop2Url)}: ${cookieHeader(hop2Url, jar) ?: 'nothing'}"
-    boolean sessionVisible = (hop2.receivedCookies ?: '').contains('AUTH_SESSION_ID')
-    logWarn "probe verdict: AUTH_SESSION_ID ${sessionVisible ? 'is visible - in-app sign-in is possible' : 'is NOT visible - header dump follows'}"
-    if (!sessionVisible) {
-        logWarn "probe header dump: ${snippet(hop2.headersDump, 600) ?: '-'}"
-    }
-}
-
 private String cookieHeader(String url, Map jar) {
     Map hostJar = jar[urlHost(url)]
     if (!hostJar) {

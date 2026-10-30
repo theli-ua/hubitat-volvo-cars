@@ -43,7 +43,8 @@ This integration installs as a Hubitat Parent App and creates Child Devices for 
 ## ⚠️ Important Notes & Limitations
 
 *   **API Key Requirement:** You *must* obtain a VCC API Key from the [Volvo Cars Developer Portal](https://developer.volvocars.com/). You will need one API Key *per Volvo ID account*.
-*   **Authentication Flow:** The current authentication flow requires your Volvo ID username and password, followed by an OTP sent to your email. This flow is specific to the integration's implementation based on observations of API interactions.
+*   **Authentication Flow:** Sign-in uses your Volvo ID username and password, followed by an OTP sent to your email. It follows the same OAuth flow the Volvo Cars mobile app uses - see [Sign-In and Tokens](#sign-in-and-tokens).
+*   **Volvo retired the old login on 2026-10-26:** versions 0.3.x and earlier fail with `400 Bad Request`, `Could not load the Volvo ID login page`, or `Refresh token missing`. Update the app code to 0.4.1 or later and sign in again.
 *   **API Rate Limits:** The Volvo API has rate limits (typically 10,000 requests per day per API key). The integration polls multiple endpoints for each vehicle during each refresh cycle. Choose your "Vehicle Data Refresh Interval" wisely (e.g., 10-15 minutes or longer) to avoid hitting this limit, especially if you have multiple vehicles.
 *   **Future Features:** [Enhancements](ENHANCEMENTS.md)
 *   **Supported Regions:** For a complete list of supported countries, check out [Volvo's API documentation on supported locations](https://developer.volvocars.com/terms-and-conditions/apis-supported-locations/).
@@ -113,6 +114,45 @@ Installation is recommended via Hubitat Package Manager (HPM).
     *   Adjust the "Vehicle Data Refresh Interval" in the "Settings" section. Be mindful of the API rate limit (10,000 calls/day per key). **DEFAULT** Every 10 Minutes
     *   Enable "Enable debug logging" if you need detailed logs for troubleshooting. Logging automatically turns off after 30 minutes.
     *   On the individual child vehicle device page, you can also configure "Use Imperial Measurements" and "Remote Start Duration".
+
+## Sign-In and Tokens
+
+The app authenticates the way the Volvo Cars mobile app does, with no client secret:
+
+1.  Authorize against `volvoid.eu.volvocars.com` using the mobile client id, a PKCE `S256` challenge, and the `vca://www.volvocars.com/l/vca/oauth/callback` redirect.
+2.  Volvo redirects to its Keycloak login at `auth.volvocars.com`, where the app submits your Volvo ID and password.
+3.  Keycloak emails a one-time code. Enter it in the app.
+4.  The redirect chain ends in a `vca://` callback carrying an authorization code, which the app exchanges with the PKCE verifier at `as/token.oauth2`.
+
+Access tokens are valid for **30 minutes**. The app refreshes at 80% of the token lifetime - about six minutes before a 30-minute token expires - and logs `Signed in to Volvo ID. Access token valid until …` once per interactive sign-in. **Revoke Authentication** clears the stored tokens and the refresh schedule.
+
+Two Hubitat HTTP behaviours are load-bearing here, and the code handles both explicitly:
+
+*   `followRedirects: false` - Hubitat must not follow the `volvoid` to `auth.volvocars.com` redirect itself, because the Keycloak session cookie is minted on that hop.
+*   `getHeaders('Set-Cookie')` - reading `resp.headers['Set-Cookie']` keeps only the *last* cookie of a multi-cookie response, which is `KC_RESTART` and guarantees a login loop. Keycloak's `AUTH_SESSION_ID` comes first.
+
+### If sign-in fails
+
+Auth failures log one `WARN` line, `Auth failure detail: …`. Read it left to right:
+
+| field | what it tells you |
+| :--- | :--- |
+| `status=` | the HTTP status Volvo returned |
+| `location=` | where Volvo tried to send the browser; a location starting `vca://` means the flow reached the callback and the code is there (values are redacted in logs) |
+| `sentCookies=` | cookies the app had for that request - `-` or a list without `AUTH_SESSION_ID` on the credentials POST means the session was lost |
+| `setCookies=` | cookies Volvo issued on the previous response - `AUTH_SESSION_ID` must appear here |
+| `body=` | a redacted snippet of the response, when Volvo sent one |
+
+Symptoms and causes:
+
+*   `Too many redirects while signing in to Volvo ID` - the session cookie is not reaching Keycloak, so it restarts the flow.
+*   `Volvo did not send an OTP code` - the credentials POST was rejected. Usually a wrong password, or Volvo changed the login page shape.
+*   `Volvo rejected the OTP code: …` - the code was wrong or expired. Press **Request New OTP**.
+*   `Could not load the Volvo ID login page` - Volvo moved the login, or the client id is no longer accepted.
+
+### If Volvo changes the login again
+
+`tools/volvo_auth_probe.py` runs the same login in a terminal using only the Python standard library (Python 3.9+), and stores tokens in `tools/volvo_tokens.json` when it succeeds. Paste the refresh token into **Already Have A Token?** and press **Use Pasted Refresh Token** to keep vehicles updating while the in-app login is broken. It is cleared from settings as soon as it is used.
 
 ## Using the Vehicle Device
 

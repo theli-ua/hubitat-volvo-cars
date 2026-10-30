@@ -675,7 +675,7 @@ private Map authRequest(String method, String url, Map form, Map jar) {
         headers['Cookie'] = cookies
     }
 
-    Map params = [uri: url, headers: headers, contentType: 'text/html', timeout: 30]
+    Map params = [uri: url, headers: headers, textParser: true, timeout: 30]
     if (form != null) {
         params.body = form
         params.requestContentType = 'application/x-www-form-urlencoded'
@@ -927,6 +927,11 @@ private String bodyText(def data) {
     }
     if (data instanceof CharSequence) {
         return data.toString()
+    }
+    // Hubitat returns a text body as [length: n, text: '...']; re-serialising that
+    // map would escape every quote in the HTML and break the kcContext regex.
+    if (data instanceof Map && data.containsKey('text')) {
+        return data['text']?.toString()
     }
     return JsonOutput.toJson(data)
 }

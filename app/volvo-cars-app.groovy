@@ -178,6 +178,11 @@ def authPage() {
             }
         }
 
+        section('Login Diagnostics') {
+            paragraph('Checks whether Hubitat can be told not to follow redirects - the one thing blocking in-app sign-in. Four anonymous requests to Volvo, no credentials involved.')
+            input 'runRedirectProbe', 'button', title: 'Run redirect probe'
+        }
+
         section('Already Have A Token?') {
             paragraph('Signing in above is the normal route. If Volvo changes their login again, a refresh '
                 + 'token obtained with tools/volvo_auth_probe.py can be pasted here as a stop-gap. It is '
@@ -314,6 +319,9 @@ void appButtonHandler(String btnName) {
             break
         case 'confirmRemoveVehicle':
             removeVehicle()
+            break
+        case 'runRedirectProbe':
+            redirectProbe()
             break
         case 'useManualToken':
             adoptManualRefreshToken()
@@ -723,6 +731,7 @@ private Map authRequest(String method, String url, Map form, Map jar) {
 private void captureAuthResponse(resp, String url, Map result, Map jar) {
     result.status = resp.status
     storeCookies(url, resp.headers, jar)
+    result.receivedCookies = cookieNames(resp.headers)
     def location = resp.headers?.location ?: resp.headers?.Location
     if (location) {
         result.location = location.toString()
@@ -848,6 +857,56 @@ private void storeCookies(String url, def headers, Map jar) {
         }
     }
     jar[host] = hostJar
+}
+
+// Names Volvo set on a response, so a swallowed redirect hop is visible.
+private String cookieNames(def headers) {
+    def raw = headers?.'Set-Cookie' ?: headers?.'set-cookie'
+    if (!raw) {
+        return 'none'
+    }
+    List<String> items = (raw instanceof List) ? raw.collect { it.toString() } : [raw.toString()]
+    return items.collect { it.split(';')[0].split('=')[0] }.join(',')
+}
+
+// Temporary diagnostic: can Hubitat be told not to follow redirects? That is the
+// only thing blocking in-app sign-in, because Keycloak mints AUTH_SESSION_ID on
+// the hop Hubitat follows by itself.
+void redirectProbe() {
+    Map query = [
+        client_id: authClientId(),
+        redirect_uri: authRedirectUri(),
+        response_type: 'code',
+        scope: 'openid conve:vehicle_relation',
+        code_challenge: pkceChallenge(newPkceVerifier()),
+        code_challenge_method: 'S256',
+        acr_values: 'urn:volvoid:aal:bronze:2sv',
+    ]
+    String url = authApiUrl() + '?' + formEncode(query)
+
+    List probes = [['baseline', [:]], ['followRedirects-false', [followRedirects: false]],
+                   ['maxRedirects-0', [maxRedirects: 0]], ['allowRedirects-false', [allowRedirects: false]]]
+    probes.each { List probe ->
+        String label = probe[0]
+        Map extra = probe[1]
+        Map jar = newCookieJar()
+        Map res = authRequestProbed(url, jar, extra)
+        logWarn "redirect probe [${label}]: status=${res.status ?: 'n/a'} location=${scrubUrl(res.location) ?: '-'} setCookies=${res.receivedCookies ?: '-'} error=${res.error ?: '-'}"
+    }
+}
+
+// httpGet with extra request parameters, for the probe only.
+private Map authRequestProbed(String url, Map jar, Map extraParams) {
+    Map result = [status: 0, location: null, html: null, error: null]
+    Map headers = ['User-Agent': 'vca-android/123', 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8']
+    Map params = [uri: url, headers: headers, textParser: true, timeout: 30]
+    extraParams.each { k, v -> params[k] = v }
+    try {
+        httpGet(params) { resp -> captureAuthResponse(resp, url, result, jar) }
+    } catch (e) {
+        result.error = e.message ?: e.toString()
+    }
+    return result
 }
 
 private String cookieHeader(String url, Map jar) {

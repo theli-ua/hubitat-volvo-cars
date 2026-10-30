@@ -8,7 +8,7 @@ import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 
 String appName() { return 'Volvo Cars' }
-String appVersion() { return '0.4.0' }
+String appVersion() { return '0.4.1' }
 String nameSpace() { return 'brianschmitt' }
 
 definition(
@@ -179,14 +179,15 @@ def authPage() {
         }
 
         section('Login Diagnostics') {
-            paragraph('Checks whether Hubitat can be told not to follow redirects - the one thing blocking in-app sign-in. Four anonymous requests to Volvo, no credentials involved.')
+            paragraph('Sign-in trouble usually means Volvo moved the login again. This fetches the authorize '
+                + 'redirect and the page behind it without credentials, and reports which cookies came back.')
             input 'runRedirectProbe', 'button', title: 'Run redirect probe'
         }
 
         section('Already Have A Token?') {
-            paragraph('Signing in above is the normal route. If Volvo changes their login again, a refresh '
-                + 'token obtained with tools/volvo_auth_probe.py can be pasted here as a stop-gap. It is '
-                + 'cleared from settings as soon as it is used.')
+            paragraph('Signing in above is the normal route. It is only worth reaching for this if Volvo breaks '
+                + 'the login page again: tools/volvo_auth_probe.py can mint a refresh token from a browser '
+                + 'login, and pasting it here keeps vehicles updating. Cleared from settings once used.')
             input 'manualRefreshToken', 'text', title: 'Refresh token', required: false, submitOnChange: true
             if (settings.manualRefreshToken) {
                 input 'useManualToken', 'button', title: 'Use Pasted Refresh Token'
@@ -624,7 +625,7 @@ void debugLogOff() {
     app.updateSetting('logEnable', [value:'false', type:'bool'])
 }
 
-private void storeTokens(Map tokenData) {
+private void storeTokens(Map tokenData, boolean fromLogin = false) {
     logDebug "Token data: ${tokenData}"
     atomicState.accessToken = tokenData.access_token
     atomicState.refreshToken = tokenData.refresh_token ?: atomicState.refreshToken
@@ -632,7 +633,13 @@ private void storeTokens(Map tokenData) {
     atomicState.tokenExpiresAt = now() + (expiresIn * 1000)
     scheduleTokenRefresh(expiresIn)
     atomicState.remove('consecutiveOtpVerified')
-    logDebug "Tokens stored. Access token expires at ${formatExpiry(atomicState.tokenExpiresAt)}"
+    if (fromLogin) {
+        // A sign-in is worth announcing; the hourly refresh underneath it is not.
+        logInfo "Signed in to Volvo ID. Access token valid until ${formatExpiry(atomicState.tokenExpiresAt)}."
+    } else {
+        logDebug "Tokens stored. Access token expires at ${formatExpiry(atomicState.tokenExpiresAt)}"
+    }
+    logDebug "Token data: ${tokenData}"
 
     if (settings.vccApiKey != app.getSetting('vccApiKey')) {
         app.updateSetting('vccApiKey', settings.vccApiKey)
@@ -1166,7 +1173,7 @@ private void requestToken(String authCode) {
                 contentType: 'application/json'])
         { resp ->
             if (resp.status == 200) {
-                storeTokens(resp.data)
+                storeTokens(resp.data, true)
                 atomicState.remove('authError')
                 clearAuthFlow()
              } else {

@@ -878,8 +878,11 @@ private List<String> rawSetCookies(resp) {
         def many = resp.getHeaders('Set-Cookie')
         if (many instanceof List) {
             many.each { out << stripCookieName(it.toString()) }
+        } else if (many instanceof Object[]) {
+            many.each { out << stripCookieName(it.toString()) }
         } else if (many) {
-            out << stripCookieName(many.toString())
+            // Hubitat returns one bracketed string: "[Set-Cookie: A=1;Path=/, Set-Cookie: B=2;Path=/]".
+            splitJoinedCookies(many.toString()).each { out << stripCookieName(it) }
         }
     } catch (ignored) {
         // getHeaders unavailable on this response type
@@ -902,10 +905,21 @@ private String stripCookieName(String value) {
     return value.trim().replaceFirst(/(?i)^set-cookie:\s*/, '')
 }
 
-// A single joined Set-Cookie string is split on ', ' followed by `name=`: an
-// Expires attribute's comma is followed by a date, never by `name=`.
+// Several Set-Cookie headers can arrive as one string. Unwrap list brackets, then
+// split on ', ' at a cookie boundary: prefer the 'Set-Cookie:' marker, otherwise
+// `name=` (an Expires attribute's comma is followed by a date, never a name).
 private List<String> splitJoinedCookies(String joined) {
-    return joined.split(/,\s*(?=[A-Za-z0-9_.\-]+=)/).findAll { it?.trim() }
+    String text = joined.trim()
+    if (text.startsWith('[') && text.endsWith(']')) {
+        text = text.substring(1, text.length() - 1)
+    }
+    List<String> parts
+    if (text =~ /(?i)set-cookie:/) {
+        parts = text.split(/(?i),\s*(?=set-cookie:)/)
+    } else {
+        parts = text.split(/,\s*(?=[A-Za-z0-9_.\-]+=)/)
+    }
+    return parts.findAll { it?.trim() }.collect { stripCookieName(it.toString()) }
 }
 
 private String cookieNames(List<String> setCookies) {

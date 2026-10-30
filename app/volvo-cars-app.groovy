@@ -401,7 +401,7 @@ void authenticate() {
     if (login.pageId != 'login' || !login.loginAction) {
         saveCookieJar(jar)
         handleAuthError("Could not load the Volvo ID login page${login.message ? ": ${login.message}" : ''}",
-                        loginPage.error ?: snippet(loginPage.html))
+                        describeHttp(loginPage))
         return
     }
 
@@ -412,8 +412,7 @@ void authenticate() {
     if (otp.pageId != 'login-otp-email' || !otp.loginAction) {
         saveCookieJar(jar)
         handleAuthError("Volvo did not send an OTP code${otp.message ? ": ${otp.message}" : ''}",
-                        otpPage.error ?: "pageId=${otp.pageId ?: 'unknown'}")
-        logDebug "Login step response: ${snippet(otpPage.html, 300)}"
+                        describeHttp(otpPage))
         return
     }
 
@@ -462,7 +461,7 @@ void submitOtp() {
     app.removeSetting('otpCode')
     clearAuthFlow()
     handleAuthError("Sign-in failed${otp.message ? ": ${otp.message}" : (result.error ? ": ${result.error}" : '')}"
-                    + '. Enter your credentials again to restart it.')
+                    + '. Enter your credentials again to restart it.', describeHttp(result))
 }
 
 void refreshTokenNow() {
@@ -713,6 +712,23 @@ private void captureAuthResponse(resp, String url, Map result, Map jar) {
         result.location = location.toString()
     }
     result.html = bodyText(resp.data)
+    result.bytes = result.html ? result.html.length() : 0
+}
+
+// One-line description of a failed step. Hubitat's debug logging auto-disables
+// after 30 minutes, and an auth failure is rare and important enough that the
+// detail must be visible without it.
+private String describeHttp(Map resp, int maxChars = 400) {
+    if (!resp) {
+        return null
+    }
+    StringBuilder sb = new StringBuilder()
+    sb.append('status=').append(resp.status ?: 'n/a')
+    sb.append(' bytes=').append(resp.bytes ?: 0)
+    sb.append(' location=').append(scrubUrl(resp.location) ?: '-')
+    sb.append(' error=').append(resp.error ?: '-')
+    sb.append(' body=').append(snippet(resp.html, maxChars) ?: '-')
+    return sb.toString()
 }
 
 // ---------------------------------------------------------------------------
@@ -863,8 +879,7 @@ private String pctEncode(String value) {
     StringBuilder out = new StringBuilder()
     value.getBytes('UTF-8').each { byte b ->
         int c = b & 0xFF
-        boolean safe = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
-                       || c == 0x2D || c == 0x2E || c == 0x5F || c == 0x7E
+        boolean safe = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x2D || c == 0x2E || c == 0x5F || c == 0x7E
         if (safe) {
             out.append((char) c)
         } else {
@@ -975,7 +990,9 @@ private void clearTokens() {
 
 private void handleAuthError(String message, String responseData = null) {
     logError "Authentication Error: ${message}"
-    if (responseData) { logDebug "Auth Error Response Data: ${responseData}" }
+    if (responseData) {
+        logWarn "Auth failure detail: ${responseData}"
+    }
     atomicState.authError = message
 }
 

@@ -899,7 +899,7 @@ private List<String> rawSetCookies(resp) {
 }
 
 private String stripCookieName(String value) {
-    return value.trim().replaceFirst('(?i)^set-cookie:\s*', '')
+    return value.trim().replaceFirst(/(?i)^set-cookie:\s*/, '')
 }
 
 // A single joined Set-Cookie string is split on ', ' followed by `name=`: an

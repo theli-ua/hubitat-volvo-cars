@@ -442,6 +442,9 @@ void authenticate() {
 }
 
 def fixHttpUrl(String url) {
+    if (!url) {
+        return url
+    }
     if (url.startsWith('http://')) {
         return url.replace('http://', 'https://')
     }
@@ -730,8 +733,10 @@ private Map authRequest(String method, String url, Map form, Map jar) {
 
 private void captureAuthResponse(resp, String url, Map result, Map jar) {
     result.status = resp.status
-    storeCookies(url, resp.headers, jar)
-    result.receivedCookies = cookieNames(resp.headers)
+    List<String> setCookies = rawSetCookies(resp)
+    storeCookies(url, setCookies, jar)
+    result.receivedCookies = cookieNames(setCookies)
+    result.cookieCount = setCookies.size()
     try {
         result.headersDump = resp.headers?.toString()
     } catch (ignored) {
@@ -839,8 +844,7 @@ private void saveCookieJar(Map jar) {
     logDebug "Cookie jar: ${jar.collect { host, cookies -> "${host}=[${cookies.keySet().join(', ')}]" }.join(' ')}"
 }
 
-private void storeCookies(String url, def headers, Map jar) {
-    List<String> items = setCookieList(headers)
+private void storeCookies(String url, List<String> items, Map jar) {
     if (!items) {
         return
     }
@@ -863,27 +867,52 @@ private void storeCookies(String url, def headers, Map jar) {
     jar[host] = hostJar
 }
 
-// Hubitat may return repeated Set-Cookie headers as a list or as one joined
-// string. Splitting on ', ' followed by `name=` is safe: an Expires attribute's
-// comma is followed by a date, never by `name=`.
-private List<String> setCookieList(def headers) {
-    def raw = headers?.'Set-Cookie' ?: headers?.'set-cookie'
-    if (raw == null) {
-        return []
+// Hubitat exposes only the last value of a repeated header through
+// resp.headers['Set-Cookie']. The sync client's getHeaders(name) returns them
+// all - each prefixed with 'Set-Cookie: ', which stripCookieName removes. Using
+// the wrong accessor silently drops every cookie but the last one, which is how
+// Keycloak's AUTH_SESSION_ID (set first of three) disappeared.
+private List<String> rawSetCookies(resp) {
+    List<String> out = []
+    try {
+        def many = resp.getHeaders('Set-Cookie')
+        if (many instanceof List) {
+            many.each { out << stripCookieName(it.toString()) }
+        } else if (many) {
+            out << stripCookieName(many.toString())
+        }
+    } catch (ignored) {
+        // getHeaders unavailable on this response type
     }
-    if (raw instanceof List) {
-        return raw.collect { it.toString() }
+    if (out) {
+        return out.findAll { it?.trim() }
     }
-    return raw.toString().split(/,\s*(?=[A-Za-z0-9_.\-]+=)/).findAll { it?.trim() }
+    try {
+        def one = resp.headers?.'Set-Cookie' ?: resp.headers?.'set-cookie'
+        if (one) {
+            splitJoinedCookies(one.toString()).each { out << stripCookieName(it) }
+        }
+    } catch (ignored) {
+        // no Set-Cookie header
+    }
+    return out.findAll { it?.trim() }
 }
 
-// Names Volvo set on a response, so a swallowed redirect hop is visible.
-private String cookieNames(def headers) {
-    List<String> items = setCookieList(headers)
-    if (!items) {
+private String stripCookieName(String value) {
+    return value.trim().replaceFirst('(?i)^set-cookie:\s*', '')
+}
+
+// A single joined Set-Cookie string is split on ', ' followed by `name=`: an
+// Expires attribute's comma is followed by a date, never by `name=`.
+private List<String> splitJoinedCookies(String joined) {
+    return joined.split(/,\s*(?=[A-Za-z0-9_.\-]+=)/).findAll { it?.trim() }
+}
+
+private String cookieNames(List<String> setCookies) {
+    if (!setCookies) {
         return 'none'
     }
-    return items.collect { it.split(';')[0].split('=')[0] }.join(',')
+    return setCookies.collect { it.split(';')[0].split('=')[0] }.join(',')
 }
 
 // Chain probe: follow the authorize redirect by hand and check that the cookies
@@ -911,7 +940,7 @@ void redirectProbe() {
     String hop2Url = absoluteUrl(hop1.location, authApiUrl())
     Map hop2 = authRequest('GET', hop2Url, null, jar)
     Map kc = parseKcContext(hop2.html)
-    logWarn "probe hop2: status=${hop2.status ?: 'n/a'} bytes=${hop2.bytes ?: 0} pageId=${kc.pageId ?: '-'} setCookies=${hop2.receivedCookies ?: '-'} error=${hop2.error ?: '-'}"
+    logWarn "probe hop2: status=${hop2.status ?: 'n/a'} bytes=${hop2.bytes ?: 0} pageId=${kc.pageId ?: '-'} setCookies=${hop2.receivedCookies ?: '-'} (${hop2.cookieCount ?: 0} headers) error=${hop2.error ?: '-'}"
     logWarn "probe jar would send to ${urlHost(hop2Url)}: ${cookieHeader(hop2Url, jar) ?: 'nothing'}"
     boolean sessionVisible = (hop2.receivedCookies ?: '').contains('AUTH_SESSION_ID')
     logWarn "probe verdict: AUTH_SESSION_ID ${sessionVisible ? 'is visible - in-app sign-in is possible' : 'is NOT visible - header dump follows'}"

@@ -411,6 +411,11 @@ void authenticate() {
                         describeHttp(loginPage))
         return
     }
+    if ((loginPage.requests ?: 1) == 1) {
+        // A single response that already holds the page means Hubitat followed the
+        // authorize redirect by itself, so those cookies belong to Keycloak.
+        rekeyJarToPageHost(jar, authApiUrl(), login.loginAction)
+    }
 
     logDebug 'Volvo ID login page loaded, submitting credentials'
     Map otpPage = authFollow('POST', login.loginAction,
@@ -636,9 +641,12 @@ private void storeTokens(Map tokenData) {
 
 private Map authFollow(String method, String startUrl, Map form, Map jar) {
     String url = startUrl
+    int requests = 0
     for (int hop = 0; hop < 8; hop++) {
         url = fixHttpUrl(url)
         Map resp = authRequest(method, url, form, jar)
+        requests++
+        resp.requests = requests
         logDebug "auth hop ${hop + 1}: ${method} ${scrubUrl(url)} -> status ${resp.status}"
 
         if (resp.code) {
@@ -681,6 +689,7 @@ private Map authRequest(String method, String url, Map form, Map jar) {
     if (cookies) {
         headers['Cookie'] = cookies
     }
+    result.sentCookies = cookies ? cookies.split(';').collect { it.trim().split('=')[0] }.join(',') : 'none'
 
     Map params = [uri: url, headers: headers, textParser: true, timeout: 30]
     if (form != null) {
@@ -758,6 +767,7 @@ private String describeHttp(Map resp, int maxChars = 400) {
     sb.append(' location=').append(scrubUrl(resp.location) ?: '-')
     sb.append(' error=').append(resp.error ?: '-')
     sb.append(' type=').append(resp.type ?: '-')
+    sb.append(' sentCookies=').append(resp.sentCookies ?: '-')
     sb.append(' body=').append(snippet(resp.html, maxChars) ?: '-')
     return sb.toString()
 }
@@ -846,6 +856,31 @@ private String cookieHeader(String url, Map jar) {
         return null
     }
     return hostJar.collect { name, value -> "${name}=${value}" }.join('; ')
+}
+
+// When Hubitat follows a redirect across hosts by itself, the cookies on that
+// response belong to the host that served the page, not to the host that was
+// asked. Keycloak's session cookie is host-only, so sending it back under the
+// wrong host means the next POST arrives with no session at all.
+private void rekeyJarToPageHost(Map jar, String requestedUrl, String pageActionUrl) {
+    String requestedHost = urlHost(requestedUrl)
+    String pageHost = pageActionUrl ? urlHost(pageActionUrl) : null
+    if (!pageHost || pageHost == requestedHost) {
+        return
+    }
+    Map moved = (jar[requestedHost] instanceof Map) ? jar[requestedHost] : null
+    if (!moved) {
+        return
+    }
+    Map target = (jar[pageHost] instanceof Map) ? jar[pageHost] : [:]
+    moved.each { name, value ->
+        if (!target.containsKey(name)) {
+            target[name] = value
+        }
+    }
+    jar[pageHost] = target
+    jar.remove(requestedHost)
+    logDebug "Response came from ${pageHost}, cookies re-keyed from ${requestedHost}"
 }
 
 // ---------------------------------------------------------------------------
